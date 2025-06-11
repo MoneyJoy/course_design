@@ -208,6 +208,8 @@ class MqttGateway:
         self.client.on_message = self.on_message    # 接收消息时的回调
 
         try:
+            print(f"🔄 正在连接MQTT代理服务器 {self.broker_ip}:{self.broker_port}")
+            
             # 连接到MQTT代理服务器
             # 参数：IP地址、端口、保持连接超时时间
             self.client.connect(self.broker_ip, self.broker_port, self.timeout)
@@ -215,8 +217,6 @@ class MqttGateway:
             # 启动网络循环，在后台线程中处理网络通信
             # 这是非阻塞的，允许主线程继续执行其他任务
             self.client.loop_start()
-
-            print(f"🔄 正在连接MQTT代理服务器 {self.broker_ip}:{self.broker_port}")
 
         except Exception as e:
             print(f"❌ 连接MQTT代理服务器失败: {e}")
@@ -316,6 +316,10 @@ class MqttGateway:
             if float(temperature) > 30.0:
                 print(f"🚨 警报: 设备 {client_id} 的温度 ({temperature}°C) 超过阈值!")
                 self.publish_command(client_id, "open_fan")
+            # 如果温度低于25°C，向设备发送关闭风扇的指令
+            elif float(temperature) < 25.0:
+                print(f"ℹ️ 提示: 设备 {client_id} 的温度 ({temperature}°C) 低于阈值，关闭风扇")
+                self.publish_command(client_id, "close_fan")
 
         except json.JSONDecodeError:
             # JSON解析失败的异常处理
