@@ -104,6 +104,10 @@ class MqttGateway:
         # MQTT客户端对象，初始化为None
         self.client = None
 
+        # 初始化风扇状态字典，用于跟踪每个设备的风扇状态
+        # True表示风扇开启，False表示风扇关闭
+        self.fan_states = {}
+
         # 初始化数据库连接并创建必要的表
         # 这一步会自动连接到MySQL数据库并创建sensor_readings表（如果不存在）
         self.db_conn = self.setup_database()
@@ -290,6 +294,8 @@ class MqttGateway:
 
         业务逻辑：
         - 当温度超过30°C时，向设备发送"open_fan"指令
+        - 当温度低于25°C时，向设备发送"close_fan"指令
+        - 使用fan_states字典跟踪每个设备的风扇状态，避免重复发送相同指令
         """
         try:
             # 将消息载荷从字节格式解码为UTF-8字符串
@@ -311,15 +317,18 @@ class MqttGateway:
             # 将传感器数据保存到数据库
             self.save_to_db(client_id, temperature)
 
+            # 获取当前设备的风扇状态（如果不存在则默认为False，表示风扇关闭）
+            current_fan_state = self.fan_states.get(client_id, False)
+
             # 业务逻辑：温度阈值检查
-            # 如果温度超过30°C，向设备发送开启风扇的指令
-            if float(temperature) > 30.0:
+            if float(temperature) > 30.0 and not current_fan_state:
                 print(f"🚨 警报: 设备 {client_id} 的温度 ({temperature}°C) 超过阈值!")
                 self.publish_command(client_id, "open_fan")
-            # 如果温度低于25°C，向设备发送关闭风扇的指令
-            elif float(temperature) < 25.0:
+                self.fan_states[client_id] = True  # 更新风扇状态为开启
+            elif float(temperature) < 25.0 and current_fan_state:
                 print(f"ℹ️ 提示: 设备 {client_id} 的温度 ({temperature}°C) 低于阈值，关闭风扇")
                 self.publish_command(client_id, "close_fan")
+                self.fan_states[client_id] = False  # 更新风扇状态为关闭
 
         except json.JSONDecodeError:
             # JSON解析失败的异常处理
