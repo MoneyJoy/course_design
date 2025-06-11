@@ -38,16 +38,13 @@ def get_db_connection():
 
 def set_device_manual_status(client_id, fan_status=None, light_status=None):
     """
-    【核心修复函数】
-    当手动控制时，不再更新旧记录，而是插入一条新的状态记录。
-    这样可以确保手动操作的状态成为数据库中最新的状态。
+    当手动控制时，通过插入一条新的状态记录来确保手动操作成为最新状态。
     """
     conn = get_db_connection()
     if conn is None: return False
     
     try:
         cursor = conn.cursor(dictionary=True)
-        # 1. 获取最新的传感器读数，以便复用
         cursor.execute(
             "SELECT temperature, humidity, light_intensity, fan_status, light_status FROM sensor_readings WHERE client_id = %s ORDER BY timestamp DESC LIMIT 1",
             (client_id,)
@@ -56,11 +53,9 @@ def set_device_manual_status(client_id, fan_status=None, light_status=None):
         if not latest_reading:
             return False
 
-        # 2. 准备新记录的数据
         new_fan_status = fan_status if fan_status is not None else latest_reading['fan_status']
         new_light_status = light_status if light_status is not None else latest_reading['light_status']
         
-        # 3. 插入一条新的记录来反映手动操作
         sql = """INSERT INTO sensor_readings 
                  (client_id, temperature, humidity, light_intensity, fan_status, light_status, control_mode) 
                  VALUES (%s, %s, %s, %s, %s, %s, %s)"""
@@ -85,7 +80,6 @@ def set_device_auto_mode(client_id):
     if conn is None: return False
     try:
         cursor = conn.cursor(dictionary=True)
-        # 1. 获取最新记录的所有数据
         cursor.execute(
             "SELECT * FROM sensor_readings WHERE client_id = %s ORDER BY timestamp DESC LIMIT 1",
             (client_id,)
@@ -93,7 +87,6 @@ def set_device_auto_mode(client_id):
         latest_reading = cursor.fetchone()
         if not latest_reading: return False
 
-        # 2. 插入一条模式为'auto'的新记录
         sql = """INSERT INTO sensor_readings 
                  (client_id, temperature, humidity, light_intensity, fan_status, light_status, control_mode) 
                  VALUES (%s, %s, %s, %s, %s, %s, %s)"""
@@ -123,7 +116,6 @@ def index():
     cursor = None
     try:
         cursor = conn.cursor(dictionary=True)
-        # 使用窗口函数找出每个设备的最新记录
         cursor.execute("""
             WITH LatestReadings AS (
                 SELECT *, ROW_NUMBER() OVER(PARTITION BY client_id ORDER BY timestamp DESC) as rn
@@ -131,19 +123,14 @@ def index():
             )
             SELECT id, client_id, temperature, humidity, light_intensity, fan_status, light_status, timestamp, control_mode
             FROM LatestReadings
-            WHERE rn <= 20  -- 每个设备最多显示20条记录
-            ORDER BY timestamp DESC;
+            WHERE rn <= 20
+            ORDER BY client_id, timestamp DESC;
         """)
         all_readings = cursor.fetchall()
         
-        # 找出每个设备的绝对最新一条记录的id，用于显示控制按钮
         latest_id_per_device = {}
         if all_readings:
-            cursor.execute("""
-                SELECT client_id, MAX(id) as max_id 
-                FROM sensor_readings 
-                GROUP BY client_id
-            """)
+            cursor.execute("SELECT client_id, MAX(id) as max_id FROM sensor_readings GROUP BY client_id")
             latest_ids_result = cursor.fetchall()
             latest_id_per_device = {row['client_id']: row['max_id'] for row in latest_ids_result}
 
@@ -156,12 +143,18 @@ def index():
             reading['fan_status'] = bool(reading['fan_status'])
             reading['light_status'] = bool(reading['light_status'])
             reading['is_latest'] = (reading['id'] == latest_id_per_device.get(reading['client_id']))
-            # 设置CSS类
+            
+            # --- ▼▼▼ 核心修复区域 1/2：重新添加低温判断 ▼▼▼ ---
             reading['temp_class'] = ''
-            if reading['temperature'] >= 30.0: reading['temp_class'] = 'temperature-high'
+            if reading['temperature'] >= 30.0:
+                reading['temp_class'] = 'temperature-high'
+            elif reading['temperature'] <= 25.0:  # 重新添加此elif判断
+                reading['temp_class'] = 'temperature-low'
+            # --- ▲▲▲ 核心修复区域 1/2：重新添加低温判断 ▲▲▲ ---
             
             reading['light_class'] = ''
-            if reading['light_intensity'] < 50.0: reading['light_class'] = 'light-low'
+            if reading['light_intensity'] < 50.0: 
+                reading['light_class'] = 'light-low'
             
         return render_template('index.html', readings=all_readings)
     except Exception as e:
@@ -183,20 +176,14 @@ def control_device():
         if not client_id or not command:
             return jsonify({'status': 'error', 'message': '缺少必要参数'}), 400
             
-        # 发布MQTT命令
         command_topic = COMMAND_TOPIC_FORMAT.format(client_id=client_id)
         command_payload = json.dumps({"command": command, "timestamp": time.time()})
         mqtt_client.publish(command_topic, command_payload, qos=1)
         
-        # 【修复】通过插入新记录来更新数据库状态
-        if command == 'open_fan':
-            set_device_manual_status(client_id, fan_status=1)
-        elif command == 'close_fan':
-            set_device_manual_status(client_id, fan_status=0)
-        elif command == 'open_light':
-            set_device_manual_status(client_id, light_status=1)
-        elif command == 'close_light':
-            set_device_manual_status(client_id, light_status=0)
+        if command == 'open_fan': set_device_manual_status(client_id, fan_status=1)
+        elif command == 'close_fan': set_device_manual_status(client_id, fan_status=0)
+        elif command == 'open_light': set_device_manual_status(client_id, light_status=1)
+        elif command == 'close_light': set_device_manual_status(client_id, light_status=0)
         
         return jsonify({'status': 'success', 'message': '命令已发送'})
     except Exception as e:
@@ -211,7 +198,6 @@ def set_auto():
         if not client_id:
             return jsonify({'status': 'error', 'message': '缺少必要参数'}), 400
         
-        # 【修复】通过插入新记录切换到自动模式
         set_device_auto_mode(client_id)
         
         return jsonify({'status': 'success', 'message': '已切换为自动模式'})
@@ -222,7 +208,6 @@ if __name__ == '__main__':
     if not os.path.exists('templates'):
         os.makedirs('templates')
     
-    # index.html内容保持不变，但修改了其中的JS逻辑
     with open('templates/index.html', 'w', encoding='utf-8') as f:
         f.write('''
 <!DOCTYPE html>
@@ -235,7 +220,10 @@ if __name__ == '__main__':
     <style>
         body { padding: 20px; }
         .table-responsive { margin-top: 20px; }
+        /* --- ▼▼▼ 核心修复区域 2/2：重新添加低温CSS样式 ▼▼▼ --- */
         .temperature-high { color: #dc3545 !important; font-weight: bold; }
+        .temperature-low { color: #0d6efd !important; font-weight: bold; }
+        /* --- ▲▲▲ 核心修复区域 2/2：重新添加低温CSS样式 ▲▲▲ --- */
         .light-low { color: #6f42c1 !important; font-weight: bold; }
         .btn-control { width: 110px; margin: 2px; }
         .status-indicator { width: 15px; height: 15px; border-radius: 50%; display: inline-block; }
@@ -352,7 +340,7 @@ if __name__ == '__main__':
         });
 
         // 每30秒自动刷新页面
-        setTimeout(() => window.location.reload(), 3000);
+        setTimeout(() => window.location.reload(), 30000);
     </script>
 </body>
 </html>
