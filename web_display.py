@@ -34,7 +34,7 @@ def index():
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT client_id, temperature, timestamp 
+            SELECT client_id, temperature, humidity, light_intensity, timestamp 
             FROM sensor_readings 
             ORDER BY timestamp DESC 
             LIMIT 100
@@ -51,21 +51,26 @@ def index():
             temp_value = float(reading['temperature'])
             reading['temperature'] = temp_value
             
-            # 3. 在后端直接判断并添加CSS类名，并打印每一步的判断过程
+            # 3. 确保湿度是浮点数
+            humidity_value = float(reading['humidity'])
+            reading['humidity'] = humidity_value
+            
+            # 4. 确保光照强度是浮点数
+            light_value = float(reading['light_intensity'])
+            reading['light_intensity'] = light_value
+            
+            # 5. 在后端直接判断并添加CSS类名
             reading['temp_class'] = '' # 先设置一个默认值
+            reading['light_class'] = '' # 光照强度的CSS类名
 
-            # print(f"--- 正在处理温度: {temp_value} (类型: {type(temp_value)}) ---")
-
-            if temp_value > 30.0:
+            if temp_value >= 30.0:
                 reading['temp_class'] = 'temperature-high'
-                # print(f"    判断结果: {temp_value} > 30.0 为 True,  分配 class: 'temperature-high'")
-            elif temp_value < 25.0:
+            elif temp_value <= 25.0:
                 reading['temp_class'] = 'temperature-low'
-                # print(f"    判断结果: {temp_value} < 25.0 为 True,  分配 class: 'temperature-low'")
-            else:
-                # 这个分支处理 25.0 <= temp_value <= 30.0 的情况
-                # print(f"    判断结果: 不满足高低温条件, 分配 class: '' (默认)")
-                pass
+            
+            # 光照强度的颜色逻辑
+            if light_value <= 50.0:
+                reading['light_class'] = 'light-low'
 
         return render_template('index.html', readings=readings)
 
@@ -96,6 +101,7 @@ if __name__ == '__main__':
         .table-responsive { margin-top: 20px; }
         .temperature-high { color: #dc3545 !important; font-weight: bold; }
         .temperature-low { color: #0d6efd !important; font-weight: bold; }
+        .light-low { color: #0d6efd !important; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -107,6 +113,8 @@ if __name__ == '__main__':
                     <tr>
                         <th>Device ID</th>
                         <th>Temperature (°C)</th>
+                        <th>Humidity (%)</th>
+                        <th>Light Intensity</th>
                         <th>Time</th>
                     </tr>
                 </thead>
@@ -116,6 +124,10 @@ if __name__ == '__main__':
                         <td>{{ reading.client_id }}</td>
                         <td class="{{ reading.temp_class }}">
                             {{ "%.2f"|format(reading.temperature) }}
+                        </td>
+                        <td>{{ "%.1f"|format(reading.humidity) }}</td>
+                        <td class="{{ reading.light_class }}">
+                            {{ "%.1f"|format(reading.light_intensity) }}
                         </td>
                         <td>{{ reading.timestamp }}</td>
                     </tr>

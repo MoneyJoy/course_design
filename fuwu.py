@@ -108,6 +108,10 @@ class MqttGateway:
         # True表示风扇开启，False表示风扇关闭
         self.fan_states = {}
 
+        # 初始化补光灯状态字典，用于跟踪每个设备的补光灯状态
+        # True表示补光灯开启，False表示补光灯关闭
+        self.light_states = {}
+
         # 初始化数据库连接并创建必要的表
         # 这一步会自动连接到MySQL数据库并创建sensor_readings表（如果不存在）
         self.db_conn = self.setup_database()
@@ -133,6 +137,8 @@ class MqttGateway:
         - id: 自增主键
         - client_id: 设备客户端ID（最大255字符）
         - temperature: 温度值（DECIMAL类型，5位数字，2位小数）
+        - humidity: 湿度值（DECIMAL类型，4位数字，1位小数）
+        - light_intensity: 光照强度值（DECIMAL类型，7位数字，1位小数）
         - timestamp: 时间戳（自动设置为当前时间）
         """
         try:
@@ -162,6 +168,14 @@ class MqttGateway:
                         -- 温度传感器读数，使用DECIMAL(5,2)存储
                         -- 5表示总位数，2表示小数位数，范围：-999.99到999.99
                         temperature DECIMAL(5,2) NOT NULL,
+                        
+                        -- 湿度传感器读数，使用DECIMAL(4,1)存储
+                        -- 4表示总位数，1表示小数位数，范围：0.0到100.0
+                        humidity DECIMAL(4,1) NOT NULL,
+                        
+                        -- 光照强度传感器读数，使用DECIMAL(7,1)存储
+                        -- 7表示总位数，1表示小数位数，范围：0.0到99999.9
+                        light_intensity DECIMAL(7,1) NOT NULL,
                         
                         -- 数据记录时间戳，默认为当前时间
                         -- 使用DATETIME类型存储完整的日期和时间信息
@@ -308,27 +322,41 @@ class MqttGateway:
             # 提取关键数据字段
             client_id = data.get('client_id')      # 设备客户端ID
             temperature = data.get('temperature')  # 温度值
+            humidity = data.get('humidity')        # 湿度值
+            light_intensity = data.get('Light intensity')  # 光照强度值
 
             # 验证数据完整性 - 检查必需字段是否存在
-            if client_id is None or temperature is None:
-                print("⚠️  警告: 接收到的数据缺少 'client_id' 或 'temperature' 字段")
+            if client_id is None or temperature is None or humidity is None or light_intensity is None:
+                print("⚠️  警告: 接收到的数据缺少必需字段")
                 return
 
             # 将传感器数据保存到数据库
-            self.save_to_db(client_id, temperature)
+            self.save_to_db(client_id, temperature, humidity, light_intensity)
 
             # 获取当前设备的风扇状态（如果不存在则默认为False，表示风扇关闭）
             current_fan_state = self.fan_states.get(client_id, False)
+            # 获取当前设备的补光灯状态（如果不存在则默认为False，表示补光灯关闭）
+            current_light_state = self.light_states.get(client_id, False)
 
             # 业务逻辑：温度阈值检查
-            if float(temperature) > 30.0 and not current_fan_state:
+            if float(temperature) >= 30.0 and not current_fan_state:
                 print(f"🚨 警报: 设备 {client_id} 的温度 ({temperature}°C) 超过阈值!")
                 self.publish_command(client_id, "open_fan")
                 self.fan_states[client_id] = True  # 更新风扇状态为开启
-            elif float(temperature) < 25.0 and current_fan_state:
+            elif float(temperature) <= 25.0 and current_fan_state:
                 print(f"ℹ️ 提示: 设备 {client_id} 的温度 ({temperature}°C) 低于阈值，关闭风扇")
                 self.publish_command(client_id, "close_fan")
                 self.fan_states[client_id] = False  # 更新风扇状态为关闭
+
+            # 业务逻辑：光照强度阈值检查
+            if float(light_intensity) < 50.0 and not current_light_state:
+                print(f"🚨 警报: 设备 {client_id} 的光照强度 ({light_intensity}) 低于阈值!")
+                self.publish_command(client_id, "open_light")
+                self.light_states[client_id] = True  # 更新补光灯状态为开启
+            elif float(light_intensity) >= 50.0 and current_light_state:
+                print(f"ℹ️ 提示: 设备 {client_id} 的光照强度 ({light_intensity}) 高于阈值，关闭补光灯")
+                self.publish_command(client_id, "close_light")
+                self.light_states[client_id] = False  # 更新补光灯状态为关闭
 
         except json.JSONDecodeError:
             # JSON解析失败的异常处理
@@ -337,26 +365,15 @@ class MqttGateway:
             # 其他异常的通用处理
             print(f"❌ 处理消息时发生错误: {e}")
 
-    def save_to_db(self, client_id, temperature):
+    def save_to_db(self, client_id, temperature, humidity, light_intensity):
         """
         将传感器数据保存到MySQL数据库
 
         参数:
             client_id (str): 设备客户端ID
             temperature (float): 温度值
-
-        功能：
-        1. 检查数据库连接状态
-        2. 如果连接断开，尝试重新连接
-        3. 执行SQL插入操作
-        4. 提交事务确保数据持久化
-        5. 处理数据库操作异常
-        6. 在发生错误时尝试重新连接数据库
-
-        数据库操作说明：
-        - 使用参数化查询防止SQL注入攻击
-        - timestamp字段会自动设置为当前时间（数据库默认值）
-        - 使用事务确保数据一致性
+            humidity (float): 湿度值
+            light_intensity (float): 光照强度值
         """
         # 检查数据库连接状态
         if self.db_conn is None or not self.db_conn.is_connected():
@@ -375,10 +392,8 @@ class MqttGateway:
             cursor = self.db_conn.cursor()
 
             # 定义SQL插入语句
-            # 注意：MySQL-connector使用%s作为参数占位符（不是%d或%f）
-            # timestamp字段使用数据库默认值（CURRENT_TIMESTAMP）
-            sql = "INSERT INTO sensor_readings (client_id, temperature) VALUES (%s, %s)"
-            val = (client_id, temperature)
+            sql = "INSERT INTO sensor_readings (client_id, temperature, humidity, light_intensity) VALUES (%s, %s, %s, %s)"
+            val = (client_id, temperature, humidity, light_intensity)
 
             # 执行SQL语句
             cursor.execute(sql, val)
@@ -386,7 +401,7 @@ class MqttGateway:
             # 提交事务，确保数据持久化到数据库
             self.db_conn.commit()
 
-            print(f"💾 数据已保存到数据库: 设备ID={client_id}, 温度={temperature}°C")
+            print(f"💾 数据已保存到数据库: 设备ID={client_id}, 温度={temperature}°C, 湿度={humidity}%, 光照强度={light_intensity}")
 
             # 关闭游标释放资源
             cursor.close()
@@ -395,7 +410,6 @@ class MqttGateway:
             print(f"❌ 数据库插入操作失败: {e}")
 
             # 发生错误时关闭当前连接并尝试重新连接
-            # 这有助于处理数据库连接超时等问题
             try:
                 self.db_conn.close()
             except:
