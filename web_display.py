@@ -352,7 +352,7 @@ if __name__ == '__main__':
         });
 
         // 每30秒自动刷新页面
-        setTimeout(() => window.location.reload(), 30000);
+        setTimeout(() => window.location.reload(), 3000);
     </script>
 </body>
 </html>
