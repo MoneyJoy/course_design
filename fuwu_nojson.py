@@ -139,6 +139,8 @@ class MqttGateway:
         - temperature: 温度值（DECIMAL类型，5位数字，2位小数）
         - humidity: 湿度值（DECIMAL类型，4位数字，1位小数）
         - light_intensity: 光照强度值（DECIMAL类型，7位数字，1位小数）
+        - fan_status: 风扇状态，使用TINYINT(1)存储布尔值
+        - light_status: 补光灯状态，使用TINYINT(1)存储布尔值
         - timestamp: 时间戳（自动设置为当前时间）
         """
         try:
@@ -176,6 +178,12 @@ class MqttGateway:
                         -- 光照强度传感器读数，使用DECIMAL(7,1)存储
                         -- 7表示总位数，1表示小数位数，范围：0.0到99999.9
                         light_intensity DECIMAL(7,1) NOT NULL,
+                        
+                        -- 风扇状态，使用TINYINT(1)存储布尔值
+                        fan_status TINYINT(1) DEFAULT 0,
+                        
+                        -- 补光灯状态，使用TINYINT(1)存储布尔值
+                        light_status TINYINT(1) DEFAULT 0,
                         
                         -- 数据记录时间戳，默认为当前时间
                         -- 使用DATETIME类型存储完整的日期和时间信息
@@ -340,15 +348,11 @@ class MqttGateway:
             light_intensity = parts[3]
             # ---【修改结束】---
 
-
             # 验证数据完整性 - 检查必需字段是否为空
             # .strip() 用于去除可能存在的前后空格
             if not all(p.strip() for p in [client_id, temperature, humidity, light_intensity]):
                 print("⚠️  警告: 接收到的数据包含空字段")
                 return
-
-            # 将传感器数据保存到数据库
-            self.save_to_db(client_id, float(temperature), float(humidity), float(light_intensity))
 
             # 获取当前设备的风扇状态（如果不存在则默认为False，表示风扇关闭）
             current_fan_state = self.fan_states.get(client_id, False)
@@ -374,6 +378,9 @@ class MqttGateway:
                 print(f"ℹ️  提示: 设备 {client_id} 的光照强度 ({light_intensity}) 高于阈值，关闭补光灯")
                 self.publish_command(client_id, "close_light")
                 self.light_states[client_id] = False  # 更新补光灯状态为关闭
+
+            # 现在再保存到数据库，状态是最新的
+            self.save_to_db(client_id, float(temperature), float(humidity), float(light_intensity))
 
         except ValueError:
             # 数值转换失败的异常处理 (例如温度、湿度等不是有效的数字)
@@ -412,9 +419,15 @@ class MqttGateway:
             # 创建数据库游标
             cursor = self.db_conn.cursor()
 
+            # 获取当前设备的风扇和灯的状态
+            fan_status = 1 if self.fan_states.get(client_id, False) else 0
+            light_status = 1 if self.light_states.get(client_id, False) else 0
+
             # 定义SQL插入语句
-            sql = "INSERT INTO sensor_readings (client_id, temperature, humidity, light_intensity) VALUES (%s, %s, %s, %s)"
-            val = (client_id, temperature, humidity, light_intensity)
+            sql = """INSERT INTO sensor_readings 
+                    (client_id, temperature, humidity, light_intensity, fan_status, light_status) 
+                    VALUES (%s, %s, %s, %s, %s, %s)"""
+            val = (client_id, temperature, humidity, light_intensity, fan_status, light_status)
 
             # 执行SQL语句
             cursor.execute(sql, val)
@@ -422,7 +435,7 @@ class MqttGateway:
             # 提交事务，确保数据持久化到数据库
             self.db_conn.commit()
 
-            print(f"💾 数据已保存到数据库: 设备ID={client_id}, 温度={temperature}°C, 湿度={humidity}%, 光照强度={light_intensity}")
+            print(f"💾 数据已保存到数据库: 设备ID={client_id}, 温度={temperature}°C, 湿度={humidity}%, 光照强度={light_intensity}, 风扇状态={fan_status}, 灯状态={light_status}")
 
             # 关闭游标释放资源
             cursor.close()
