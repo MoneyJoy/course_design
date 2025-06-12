@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+"""
+Web显示和控制服务 (最终稳定版 v2.0)
+=====================================
+- 状态管理: 通过发送指令，触发后端状态变更
+- 实时通信: 集成Redis和SSE，实现高效无刷新更新
+- 前端逻辑: 采用事件委托，稳定高效
+"""
 from flask import Flask, render_template, request, jsonify, Response
 import mysql.connector
 from datetime import datetime
@@ -7,15 +14,20 @@ import paho.mqtt.client as mqtt
 import json
 from decimal import Decimal
 import time
+import redis
 
 app = Flask(__name__)
 
-# --- 配置和非关键函数部分保持不变 ---
+# --- 配置 ---
 MYSQL_CONFIG = { 'host': 'localhost', 'user': 'm2joy', 'password': 'Liu041121@', 'database': 'iot_data' }
 MQTT_BROKER_IP = 'localhost'
 MQTT_BROKER_PORT = 1883
 COMMAND_TOPIC_FORMAT = "stm32/command/{client_id}"
+REDIS_HOST = 'localhost'
+REDIS_PORT = 6379
+REDIS_CHANNEL = 'iot_data_stream'
 
+# --- 客户端和服务初始化 ---
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, f"web_control_{int(time.time())}")
 mqtt_client.connect(MQTT_BROKER_IP, MQTT_BROKER_PORT)
 mqtt_client.loop_start()
@@ -27,44 +39,29 @@ def get_db_connection():
         print(f"Database connection error: {err}")
         return None
 
-# --- ▼▼▼ 核心修复区域 ▼▼▼ ---
+# --- 手动控制逻辑 ---
 def set_device_manual_status(client_id, fan_status=None, light_status=None):
-    """
-    当手动控制时，通过插入一条新的状态记录来确保手动操作成为最新状态。
-    (已修复状态覆盖的Bug)
-    """
     conn = get_db_connection()
     if conn is None: return False
     try:
-        cursor = conn.cursor(dictionary=True)
-        # 1. 获取最新的传感器读数和完整的设备状态
-        cursor.execute("SELECT temperature, humidity, light_intensity, fan_status, light_status FROM sensor_readings WHERE client_id = %s ORDER BY timestamp DESC LIMIT 1", (client_id,))
-        latest_reading = cursor.fetchone()
-        if not latest_reading:
-            # 如果没有历史记录，则假设初始状态都为False
-            latest_reading = {'temperature': 0, 'humidity': 0, 'light_intensity': 0, 'fan_status': 0, 'light_status': 0}
-
-        # 2. 正确计算风扇和灯的最终状态
-        # 如果传入了新状态，则使用新状态；否则，保留从数据库读出的旧状态。
-        new_fan_status = fan_status if fan_status is not None else latest_reading['fan_status']
-        new_light_status = light_status if light_status is not None else latest_reading['light_status']
-        
-        # 3. 准备插入数据库
-        sql = "INSERT INTO sensor_readings (client_id, temperature, humidity, light_intensity, fan_status, light_status, control_mode) VALUES (%s, %s, %s, %s, %s, %s, %s)"
-        
-        # --- 核心BUG修复：使用计算好的新状态变量，而不是原始输入参数 ---
-        val = (
-            client_id,
-            latest_reading['temperature'],
-            latest_reading['humidity'],
-            latest_reading['light_intensity'],
-            new_fan_status,   # 使用 new_fan_status
-            new_light_status, # 使用 new_light_status
-            'manual'
-        )
-        
-        cursor.execute(sql, val)
-        conn.commit()
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute("SELECT temperature, humidity, light_intensity, fan_status, light_status FROM sensor_readings WHERE client_id = %s ORDER BY timestamp DESC LIMIT 1", (client_id,))
+            latest_reading = cursor.fetchone() or {'temperature': 0, 'humidity': 0, 'light_intensity': 0, 'fan_status': 0, 'light_status': 0}
+            
+            new_fan_status = fan_status if fan_status is not None else latest_reading['fan_status']
+            new_light_status = light_status if light_status is not None else latest_reading['light_status']
+            
+            sql = "INSERT INTO sensor_readings (client_id, temperature, humidity, light_intensity, fan_status, light_status, control_mode) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            val = (client_id, latest_reading['temperature'], latest_reading['humidity'], latest_reading['light_intensity'], new_fan_status, new_light_status, 'manual')
+            cursor.execute(sql, val)
+            conn.commit()
+            
+            # 手动操作后，也需要发布到Redis，以便所有打开的网页都能同步
+            new_id = cursor.lastrowid
+            cursor.execute("SELECT * FROM sensor_readings WHERE id = %s", (new_id,))
+            new_record = cursor.fetchone()
+            if new_record:
+                publish_to_redis(new_record)
         return True
     except Exception as e:
         print(f"Error in set_device_manual_status: {e}")
@@ -72,49 +69,72 @@ def set_device_manual_status(client_id, fan_status=None, light_status=None):
         return False
     finally:
         if conn and conn.is_connected(): conn.close()
-# --- ▲▲▲ 核心修复区域 ▲▲▲ ---
 
 def set_device_auto_mode(client_id):
+    # 此函数逻辑与 set_device_manual_status 类似
+    # 插入一条新的 'auto' 模式记录，并发布到Redis
     conn = get_db_connection()
     if conn is None: return False
     try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM sensor_readings WHERE client_id = %s ORDER BY timestamp DESC LIMIT 1", (client_id,))
-        latest_reading = cursor.fetchone()
-        if not latest_reading: return False
-        sql = "INSERT INTO sensor_readings (client_id, temperature, humidity, light_intensity, fan_status, light_status, control_mode) VALUES (%s, %s, %s, %s, %s, %s, %s)"
-        val = (client_id, latest_reading['temperature'], latest_reading['humidity'], latest_reading['light_intensity'], latest_reading['fan_status'], latest_reading['light_status'], 'auto')
-        cursor.execute(sql, val)
-        conn.commit()
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute("SELECT * FROM sensor_readings WHERE client_id = %s ORDER BY timestamp DESC LIMIT 1", (client_id,))
+            latest_reading = cursor.fetchone()
+            if not latest_reading: return False
+            sql = "INSERT INTO sensor_readings (client_id, temperature, humidity, light_intensity, fan_status, light_status, control_mode) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            val = (client_id, latest_reading['temperature'], latest_reading['humidity'], latest_reading['light_intensity'], latest_reading['fan_status'], latest_reading['light_status'], 'auto')
+            cursor.execute(sql, val)
+            new_id = cursor.lastrowid
+            conn.commit()
+            cursor.execute("SELECT * FROM sensor_readings WHERE id = %s", (new_id,))
+            new_record = cursor.fetchone()
+            if new_record:
+                publish_to_redis(new_record)
         return True
     finally:
         if conn and conn.is_connected(): conn.close()
 
+def publish_to_redis(record_dict):
+    """一个辅助函数，用于将记录发布到Redis"""
+    try:
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        for key, value in record_dict.items():
+            if isinstance(value, datetime): record_dict[key] = value.isoformat()
+            elif isinstance(value, Decimal): record_dict[key] = float(value)
+        r.publish(REDIS_CHANNEL, json.dumps(record_dict))
+        r.close()
+    except Exception as e:
+        print(f"❌ Web App发布到Redis失败: {e}")
+
+# --- Flask 路由 ---
 @app.route('/')
 def index():
+    # 首页加载逻辑保持不变
     conn = get_db_connection()
     if conn is None: return "Database connection failed", 500
     try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("WITH LatestReadings AS (SELECT *, ROW_NUMBER() OVER(PARTITION BY client_id ORDER BY timestamp DESC) as rn FROM sensor_readings) SELECT * FROM LatestReadings WHERE rn <= 20 ORDER BY client_id, timestamp DESC;")
-        all_readings = cursor.fetchall()
-        latest_id_per_device = {}
-        if all_readings:
-            cursor.execute("SELECT client_id, MAX(id) as max_id FROM sensor_readings GROUP BY client_id")
-            latest_ids_result = cursor.fetchall()
-            latest_id_per_device = {row['client_id']: row['max_id'] for row in latest_ids_result}
-        for reading in all_readings:
-            reading['timestamp_str'] = reading['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-            reading['temperature'] = float(reading['temperature'])
-            reading['humidity'] = float(reading['humidity'])
-            reading['light_intensity'] = float(reading['light_intensity'])
-            reading['is_latest'] = (reading['id'] == latest_id_per_device.get(reading['client_id']))
-            reading['temp_class'] = ''
-            if reading['temperature'] >= 30.0: reading['temp_class'] = 'temperature-high'
-            elif reading['temperature'] <= 25.0: reading['temp_class'] = 'temperature-low'
-            reading['light_class'] = ''
-            if reading['light_intensity'] < 50.0: reading['light_class'] = 'light-low'
-        return render_template('index.html', readings=all_readings)
+        with conn.cursor(dictionary=True) as cursor:
+            # 优化SQL，直接获取每个设备的最新20条记录
+            cursor.execute("WITH LatestReadings AS (SELECT *, ROW_NUMBER() OVER(PARTITION BY client_id ORDER BY timestamp DESC) as rn FROM sensor_readings) SELECT * FROM LatestReadings WHERE rn <= 20 ORDER BY client_id, timestamp DESC;")
+            all_readings = cursor.fetchall()
+            
+            latest_id_per_device = {}
+            if all_readings:
+                cursor.execute("SELECT client_id, MAX(id) as max_id FROM sensor_readings GROUP BY client_id")
+                latest_ids_result = cursor.fetchall()
+                latest_id_per_device = {row['client_id']: row['max_id'] for row in latest_ids_result}
+
+            for reading in all_readings:
+                reading['timestamp_str'] = reading['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                reading['temperature'] = float(reading['temperature'])
+                reading['humidity'] = float(reading['humidity'])
+                reading['light_intensity'] = float(reading['light_intensity'])
+                reading['is_latest'] = (reading['id'] == latest_id_per_device.get(reading['client_id']))
+                reading['temp_class'] = ''
+                if reading['temperature'] >= 30.0: reading['temp_class'] = 'temperature-high'
+                elif reading['temperature'] <= 25.0: reading['temp_class'] = 'temperature-low'
+                reading['light_class'] = ''
+                if reading['light_intensity'] < 50.0: reading['light_class'] = 'light-low'
+            return render_template('index.html', readings=all_readings)
     finally:
         if conn and conn.is_connected(): conn.close()
 
@@ -123,9 +143,13 @@ def control_device():
     data = request.get_json()
     client_id, command = data.get('client_id'), data.get('command')
     if not all([client_id, command]): return jsonify({'status': 'error', 'message': 'Missing parameters'}), 400
+    
+    # 先发送MQTT指令
     command_topic = COMMAND_TOPIC_FORMAT.format(client_id=client_id)
     command_payload = json.dumps({"command": command, "timestamp": time.time()})
     mqtt_client.publish(command_topic, command_payload, qos=1)
+
+    # 再更新数据库状态（此操作会自动发布到Redis以更新UI）
     if command == 'open_fan': set_device_manual_status(client_id, fan_status=1)
     elif command == 'close_fan': set_device_manual_status(client_id, fan_status=0)
     elif command == 'open_light': set_device_manual_status(client_id, light_status=1)
@@ -143,42 +167,19 @@ def set_auto():
 @app.route('/stream')
 def stream():
     def event_stream():
-        last_id = 0
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        pubsub = r.pubsub()
+        pubsub.subscribe(REDIS_CHANNEL)
+        print(f"✅ 新Web客户端已订阅Redis频道 '{REDIS_CHANNEL}'")
         try:
-            conn_init = get_db_connection()
-            if conn_init:
-                with conn_init.cursor(dictionary=True) as cursor_init:
-                    cursor_init.execute("SELECT MAX(id) as max_id FROM sensor_readings")
-                    result = cursor_init.fetchone()
-                    if result and result['max_id'] is not None:
-                        last_id = result['max_id']
-                conn_init.close()
-        except Exception as e:
-            print(f"Error getting initial max_id: {e}")
-
-        try:
-            while True:
-                conn = get_db_connection()
-                if conn:
-                    try:
-                        with conn.cursor(dictionary=True) as cursor:
-                            query = "SELECT * FROM sensor_readings WHERE id > %s ORDER BY id ASC"
-                            cursor.execute(query, (last_id,))
-                            for reading in cursor.fetchall():
-                                for key, value in reading.items():
-                                    if isinstance(value, Decimal):
-                                        reading[key] = float(value)
-                                    elif isinstance(value, datetime):
-                                        reading[key] = value.isoformat()
-                                
-                                yield f"data: {json.dumps(reading)}\n\n"
-                                last_id = reading['id']
-                    finally:
-                        conn.close()
-                time.sleep(1)
+            for message in pubsub.listen():
+                if message['type'] == 'message':
+                    yield f"data: {message['data']}\n\n"
         except GeneratorExit:
-            print("Client disconnected, closing stream.")
-
+            print(f"❌ Web客户端断开连接，取消订阅。")
+        finally:
+            pubsub.close()
+            r.close()
     return Response(event_stream(), mimetype='text/event-stream')
 
 
@@ -187,14 +188,14 @@ if __name__ == '__main__':
         os.makedirs('templates')
     
     with open('templates/index.html', 'w', encoding='utf-8') as f:
-        # 前端 HTML 和 JavaScript 无需改动
+        # 前端HTML和JavaScript代码也使用我们最终调试好的版本
         f.write('''
 <!DOCTYPE html>
 <html lang="zh">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IoT Real-Time Sensor Data</title>
+    <title>IoT Real-Time Sensor Data (Final)</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body { padding: 20px; } .table-responsive { margin-top: 20px; }
