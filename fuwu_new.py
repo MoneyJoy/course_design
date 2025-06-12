@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-MQTT物联网网关服务 (最终稳定版 v2.0)
+MQTT物联网网关服务 (最终稳定版 v2.1)
 =====================================
 - 状态管理: 数据库作为唯一可信源
 - 实时通信: 集成Redis发布/订阅模式，实现高效消息通知
+- 新增功能: 数据平滑度检查 (v2.1)
 """
 import paho.mqtt.client as mqtt
 import json
@@ -33,6 +34,15 @@ REDIS_HOST = 'localhost'
 REDIS_PORT = 6379
 REDIS_CHANNEL = 'iot_data_stream'
 
+# --- ▼▼▼ 新增：数据平滑度检查配置 ▼▼▼ ---
+# 是否启用数据平滑度检查功能
+SMOOTHING_CHECKS_ENABLED = True
+# 温度单次变化允许的最大阈值 (摄氏度)
+MAX_TEMP_CHANGE_PER_READING = 10.0
+# 湿度单次变化允许的最大阈值 (%RH)
+MAX_HUMIDITY_CHANGE_PER_READING = 25.0
+# --- ▲▲▲ 新增配置结束 ▲▲▲ ---
+
 
 class MqttGateway:
     def __init__(self, broker_ip, port, timeout):
@@ -41,6 +51,11 @@ class MqttGateway:
         self.timeout = timeout
         self.client = None
         
+        # --- ▼▼▼ 新增：用于存储每个设备上一次有效读数的字典 ▼▼▼ ---
+        self.last_valid_readings = {}
+        # 结构: {'client_id': {'temperature': 25.5, 'humidity': 60.1}, ...}
+        # --- ▲▲▲ 新增字典结束 ▲▲▲ ---
+
         try:
             self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
             self.redis_client.ping()
@@ -91,7 +106,6 @@ class MqttGateway:
     def publish_to_redis(self, record_dict):
         if not self.redis_client: return
         try:
-            # 预处理数据类型以确保JSON兼容性
             for key, value in record_dict.items():
                 if isinstance(value, datetime):
                     record_dict[key] = value.isoformat()
@@ -115,6 +129,26 @@ class MqttGateway:
             client_id, temp_str, hum_str, light_str = parts
             temperature, humidity, light_intensity = float(temp_str), float(hum_str), float(light_str)
 
+            # --- ▼▼▼ 新增：数据平滑度检查逻辑 ▼▼▼ ---
+            if SMOOTHING_CHECKS_ENABLED:
+                last_reading = self.last_valid_readings.get(client_id)
+                if last_reading: # 如果存在该设备的上一次读数
+                    # 检查温度跳变
+                    temp_diff = abs(temperature - last_reading['temperature'])
+                    if temp_diff > MAX_TEMP_CHANGE_PER_READING:
+                        print(f"⚠️  数据异常: 设备 {client_id} 温度突变 {temp_diff:.1f}°C (阈值 {MAX_TEMP_CHANGE_PER_READING}°C)，数据已丢弃。")
+                        return # 丢弃该数据点
+
+                    # 检查湿度跳变
+                    hum_diff = abs(humidity - last_reading['humidity'])
+                    if hum_diff > MAX_HUMIDITY_CHANGE_PER_READING:
+                        print(f"⚠️  数据异常: 设备 {client_id} 湿度突变 {hum_diff:.1f}% (阈值 {MAX_HUMIDITY_CHANGE_PER_READING}%)，数据已丢弃。")
+                        return # 丢弃该数据点
+                
+                # 如果数据有效或这是第一次收到数据，更新“上一次有效读数”
+                self.last_valid_readings[client_id] = {'temperature': temperature, 'humidity': humidity}
+            # --- ▲▲▲ 数据平滑度检查结束 ▲▲▲ ---
+
             latest_status = self.get_latest_device_status(client_id)
             db_fan_status = bool(latest_status['fan_status']) if latest_status else False
             db_light_status = bool(latest_status['light_status']) if latest_status else False
@@ -137,7 +171,6 @@ class MqttGateway:
                     self.publish_command(client_id, "close_light")
                     new_light_state = False
             
-            # 统一的数据保存和发布流程
             conn = self.get_db_connection()
             if not conn: return
             try:
@@ -146,11 +179,10 @@ class MqttGateway:
                              VALUES (%s, %s, %s, %s, %s, %s, %s)"""
                     val = (client_id, temperature, humidity, light_intensity, 1 if new_fan_state else 0, 1 if new_light_state else 0, new_mode)
                     cursor.execute(sql, val)
-                    new_id = cursor.lastrowid # 获取新插入记录的ID
+                    new_id = cursor.lastrowid
                     conn.commit()
                     print(f"💾 数据已保存到数据库, ID={new_id}")
                     
-                    # 获取完整的新记录并发布到Redis
                     cursor.execute("SELECT * FROM sensor_readings WHERE id = %s", (new_id,))
                     new_record = cursor.fetchone()
                     if new_record:
@@ -168,8 +200,9 @@ class MqttGateway:
         print(f"📤 已发送指令 '{command}' 到 '{command_topic}'")
 
 if __name__ == '__main__':
+    # ... (主程序入口保持不变) ...
     gateway = MqttGateway(MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_TIMEOUT)
-    print("🚀 MQTT物联网网关服务已启动 (v2.0 - Redis集成版)")
+    print("🚀 MQTT物联网网关服务已启动 (v2.1 - 数据平滑检查版)")
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt:
